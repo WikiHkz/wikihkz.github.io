@@ -235,6 +235,7 @@ bpftool gen skeleton minimal.bpf.o > minimal.skel.h
 在`src`目录再新建一个`nonCore`文件夹，并分别创建`CMakeLists.txt`.
 
 ```bash
+# /tcpVision/src
 .
 ├── CMakeLists.txt
 └── nonCore
@@ -277,7 +278,7 @@ add_executable(${app_stem} ${app_stem}.c)
 target_link_libraries(${app_stem} ${app_stem}_skel)
 ```
 
-## 源码 nonCore
+## nonCore
 
 实现一个简单的ebpf程序，通常只需要3个基本的c文件。例如在我们的例子中，只有三个文件。
 
@@ -413,7 +414,7 @@ static int sock_handle(bool receiving, void *ctx, struct sk_common_regs *sk, siz
 	if (event.L_port == 22) // 过滤本地22端口(ssh开发背景流量过多)
 		return 0;
 	
-	// 所有的IP都是大端存储的，但是在此处没有进行转换，而是放在了用户空间进行转换
+	// 所有的IP都是大端存储的，但是不需要进行特殊处理。因为IP是使用bit位存储的。
 	if (family == AF_INET)
 	{
 		bpf_probe_read_kernel(&event.L_ip_v4, sizeof(event.L_ip_v4), &sk->skc_rcv_saddr);
@@ -988,5 +989,277 @@ struct pt_regs
 
 eBPF 的 CORE（CO-RE，Compile Once – Run Everywhere）是一种旨在提高 eBPF 程序可移植性和兼容性的技术。它允许开发者编写一次 eBPF 程序，并在不同的内核版本和架构上运行，而不需要为每个目标环境重新编译或手动调整代码。
 
+CORE依赖内核BTF 支持 (5.2+)
 
+```bash
+// 检查内核是否开启BTF支持
+cat /boot/config-$(uname -r) | grep CONFIG_DEBUG_INFO_BTF=y
+```
+
+> Linux 5.2 虽然支持了 CONFIG_DEBUG_INFO_BTF，但对 CO-RE 的支持还不完整。主要原因包括：
+>
+> 1. 5.2 版本的 BTF 信息还不够完整，缺少一些重要的类型信息，特别是对函数、指针等复杂类型的支持还不完善，某些内核结构体的关键信息可能缺失。
+> 2. 对多级结构体访问的重定位支持不完整，某些复杂的重定位场景可能会失败。
+>
+> 技术上可以在 5.2 版本上使用一些基本的 CO-RE 功能，但会遇到很多限制和兼容性问题。为了获得完整的 CO-RE 体验，建议使用 5.6 或更高版本的内核。
+
+在本节，我们将会介绍，如何开发core支持的ebpf程序。
+
+### 引入vmlinux.h
+
+引入vmlinux.h是实现CORE的关键所在。vmlinux.h 是 Linux 内核中一个非常重要的头文件，它包含了内核的 BTF (BPF Type Format) 信息。
+
+- vmlinux.h 本质上是将内核的 BTF 数据转换成 C 语言的类型定义
+
+- 它包含了内核中所有的结构体定义、类型信息、函数原型等这使得用户态程序可以直接访问和使用内核数据结构，而不需要手动重新定义
+- 它是 eBPF (Extended Berkeley Packet Filter) 程序开发的基础
+- 允许 eBPF 程序直接使用内核数据结构，无需维护单独的头文件确保了类型信息的准确性和完整性
+
+使用vmlinux.h的优点主要是：
+
+- 类型安全
+  - 确保 eBPF 程序使用正确的数据结构
+  - 减少由于手动定义结构体导致的错误
+- 维护简便
+  - 自动跟随内核更新
+  - 无需手动同步头文件
+- 开发效率
+  - 简化了 eBPF 程序的开发流程
+  - 提供了完整的内核符号信息
+
+vmlinux.h可以通过bpftool工具本地生成。
+
+```bash
+# https://github.com/libbpf/libbpf-bootstrap/blob/master/tools/gen_vmlinux_h.sh
+
+#/bin/sh
+$(dirname "$0")/bpftool btf dump file ${1:-/sys/kernel/btf/vmlinux} format c
+```
+
+这个头文件必须要和cpu arch完全匹配，但是对内核版本并没有严格的要求，我们可以通过本地生成，也可以直接从GitHub上引入。
+
+```bash
+cd 3rdparty
+git clone https://github.com/libbpf/vmlinux.h.git
+mkdir vmlinux
+mv vmlinux.h/include/* vmlinux/
+rm -rf vmlinux.h/
+```
+
+在`3rdparty`路径中引入了libbpf官方在GitHub上整理好的vmlinux.h头文件。
+
+同时还需要对cmake文件做一定的修改。
+
+> 上文提到的FindBpfObject.cmake默认会在本地使用bpftool工具创建vmlinux.h头文件
+
+### cmake
+
+在`src`目录再新建一个`nonCore`文件夹，并分别创建`CMakeLists.txt`.
+
+```bash
+# /tcpVision/src
+.
+├── CMakeLists.txt
+├── core
+│   ├── CMakeLists.txt
+│   ├── tcpVision.bpf.c
+│   ├── tcpVision.c
+│   └── tcpVision.h
+└── nonCore
+    ├── CMakeLists.txt
+    ├── tcpVision.bpf.c
+    ├── tcpVision.c
+    └── tcpVision.h
+```
+
+其中`src/CMakeLists.txt`的要做一定的修改，内容为：
+
+```cmake
+cmake_minimum_required(VERSION 3.10)
+project(tcpVision)
+set(CMAKE_C_STANDARD 11)
+
+list(APPEND CMAKE_MODULE_PATH ${CMAKE_CURRENT_SOURCE_DIR}/../tools/cmake)
+
+if(${CMAKE_SYSTEM_PROCESSOR} MATCHES "x86_64")
+  set(ARCH "x86")
+elseif(${CMAKE_SYSTEM_PROCESSOR} MATCHES "arm")
+  set(ARCH "arm")
+elseif(${CMAKE_SYSTEM_PROCESSOR} MATCHES "aarch64")
+  set(ARCH "arm64")
+elseif(${CMAKE_SYSTEM_PROCESSOR} MATCHES "ppc64le")
+  set(ARCH "powerpc")
+elseif(${CMAKE_SYSTEM_PROCESSOR} MATCHES "mips")
+  set(ARCH "mips")
+elseif(${CMAKE_SYSTEM_PROCESSOR} MATCHES "riscv64")
+  set(ARCH "riscv")
+elseif(${CMAKE_SYSTEM_PROCESSOR} MATCHES "loongarch64")
+  set(ARCH "loongarch")
+endif()
+set(BPFOBJECT_VMLINUX_H ${CMAKE_CURRENT_SOURCE_DIR}/../3rdparty/vmlinux/${ARCH}/vmlinux.h)
+
+
+set(BPFOBJECT_BPFTOOL_EXE ${CMAKE_CURRENT_SOURCE_DIR}/../3rdparty/bpftool/src/bpftool)
+set(LIBBPF_INCLUDE_DIRS ${CMAKE_CURRENT_SOURCE_DIR}/../3rdparty/bpftool/src/libbpf/include)
+set(LIBBPF_LIBRARIES ${CMAKE_CURRENT_SOURCE_DIR}/../3rdparty/bpftool/src/libbpf/libbpf.a)
+
+find_package(BpfObject REQUIRED)
+
+# add_subdirectory(nonCore)
+add_subdirectory(core)
+```
+
+主要做了三件事情：
+
+1. 设置当前的CPU ARCH信息
+2. 设置 `BPFOBJECT_VMLINUX_H`变量(FindBpfObject.cmake会查找这个变量)
+3. 注释`nonCore`子文件夹并添加`core`(主要是因为文件名称冲突了)
+
+其中`src/core/CMakeLists.txt`的内容为：
+
+```cmake
+cmake_minimum_required(VERSION 3.10)
+project(tcpVisionNonCore)
+
+set(app_stem "tcpVision")
+
+bpf_object(${app_stem} ${app_stem}.bpf.c)
+add_dependencies(${app_stem}_skel libbpf-build bpftool-build)
+
+add_executable(${app_stem} ${app_stem}.c)
+target_link_libraries(${app_stem} ${app_stem}_skel)
+```
+
+> `src/core/CMakeLists.txt`和`src/nonCore/CMakeLists.txt`的内容以及文件名是完全一样的。
+>
+> 这才导致了在`src/CMakeLists.txt`中不能同时编译`add_subdirectory(nonCore)`和`add_subdirectory(core)`。
+
+### 源码
+
+core的版本与nonCore的版本，在`tcpVision.c`文件上，没有任何区别。
+
+在`tcpVision.h`文件上，唯一的区别在于core的版本删除了`struct pt_regs`结构体的定义。
+
+> 因为引入了 vmlinux.h，里面有完整的`pt_regs`的定义
+
+因此我们重点关注`tcpVision.bpf.c`文件。
+
+```c
+#define __KERNEL__
+#include <vmlinux.h>  // 引入vmlinux.h
+#include <bpf/bpf_core_read.h>
+#include <bpf/bpf_helpers.h>
+#include <bpf/bpf_tracing.h>
+#include <bpf/bpf_endian.h>
+
+#include "tcpVision.h"
+
+#define AF_INET 2
+#define AF_INET6 10
+
+struct
+{
+	// 创建环形缓冲区map
+	__uint(type, BPF_MAP_TYPE_PERF_EVENT_ARRAY);
+	__uint(key_size, sizeof(__u32));   // cpu id
+	__uint(value_size, sizeof(__u32)); // 文件描述符fd
+	__uint(max_entries, 128);		   // 最多支持128个cpu
+} events SEC(".maps");
+
+static int sock_handle(bool receiving, void *ctx, struct sock *sk, size_t size)
+{
+	__u16 family;
+	__u16 R_port;
+	__u32 pid;
+	family = BPF_CORE_READ(sk, __sk_common.skc_family);
+	if (family != AF_INET && family != AF_INET6)
+		return 0;
+	struct tcp_event event = {};
+	// bpf_get_current_pid_tgid 返回 pid 和 tid
+	pid = bpf_get_current_pid_tgid() >> 32;
+	bpf_get_current_comm(&event.comm, sizeof(event.comm));	
+	event.tgid = pid;
+	event.pkt_len = size;
+	event.L_port = BPF_CORE_READ(sk, __sk_common.skc_num);
+	event.R_port = bpf_ntohs(BPF_CORE_READ(sk, __sk_common.skc_dport));
+	event.af = family;
+	event.proto = 1;		// TCP
+	if (event.L_port == 22) // 过滤本地22端口(ssh开发背景流量过多)
+		return 0;
+	
+	// 所有的IP都是大端存储的，但是在此处没有进行转换，而是放在了用户空间进行转换
+	if (family == AF_INET)
+	{
+		BPF_CORE_READ_INTO(&event.L_ip_v4, sk, __sk_common.skc_rcv_saddr);
+		BPF_CORE_READ_INTO(&event.R_ip_v4, sk, __sk_common.skc_daddr);
+	}
+	else
+	{
+		BPF_CORE_READ_INTO(&event.L_ip_v6, sk, __sk_common.skc_v6_rcv_saddr.in6_u.u6_addr32);
+		BPF_CORE_READ_INTO(&event.R_ip_v6, sk, __sk_common.skc_v6_daddr.in6_u.u6_addr32);
+	}
+	event.direct_input_flag = receiving ? 1 : 0;
+	// 将数据添加到缓冲区
+	bpf_perf_event_output(ctx, &events, BPF_F_CURRENT_CPU, &event, sizeof(event));
+	return 0;
+}
+
+// rference https://elixir.bootlin.com/linux/v5.15.115/source/net/ipv4/tcp.c#L1549
+SEC("kprobe/tcp_cleanup_rbuf")
+int BPF_KPROBE(tcp_cleanup_rbuf, void *sk, int copied)
+{
+	if (copied <= 0)
+		return 0;
+	return sock_handle(true, ctx, sk, copied);
+}
+
+// rference https://elixir.bootlin.com/linux/v5.15.115/source/net/ipv4/tcp.c#L1457
+SEC("kprobe/tcp_sendmsg")
+int BPF_KPROBE(tcp_sendmsg, void *sk, void *msg, size_t size)
+{
+	return sock_handle(false, ctx, sk, size);
+}
+
+char LICENSE[] SEC("license") = "GPL";
+```
+
+由于引入了vmlinux.h的缘故，我们可以访问内核中所有的结构体的定义，自然不再需要手动定义`sk_common_regs`结构体。我们可以直接访问`sock`和`sk_common`结构体。
+
+同时`in6_addr`结构体也包含在vmlinux.h中，我们也不再需要引入`linux/in6.h`头文件。
+
+其余最大的改变在于从内核中读取数据的部分。
+
+我们在core的版本中，主要使用了两个宏：
+
+```c
+BPF_CORE_READ
+BPF_CORE_READ_INTO
+```
+
+这两个宏没什么本质的区别，只是一个直接返回值，另一个通过指针直接将数据写入缓冲区的区别。
+
+**`BPF_CORE_READ`**是 libbpf 提供的一个重要宏，它的主要作用是实现 CO-RE (Compile Once - Run Everywhere) 中的结构体成员访问。
+
+下面列出了在core和nonCore版本下，读取内核数据关键代码的差别：
+
+```c
+family = BPF_CORE_READ(sk, __sk_common.skc_family);
+// bpf_probe_read_kernel(&family, sizeof(family), &sk->family);
+
+event.L_port = BPF_CORE_READ(sk, __sk_common.skc_num);
+event.R_port = bpf_ntohs(BPF_CORE_READ(sk, __sk_common.skc_dport));
+// bpf_probe_read_kernel(&event.L_port, sizeof(event.L_port), &sk->skc_num);
+// bpf_probe_read_kernel(&event.R_port, sizeof(event.R_port), &sk->skc_dport);
+// event.R_port = bpf_ntohs(event.R_port);
+
+BPF_CORE_READ_INTO(&event.L_ip_v4, sk, __sk_common.skc_rcv_saddr);
+BPF_CORE_READ_INTO(&event.R_ip_v4, sk, __sk_common.skc_daddr);
+// bpf_probe_read_kernel(&event.L_ip_v4, sizeof(event.L_ip_v4), &sk->skc_rcv_saddr);
+// bpf_probe_read_kernel(&event.R_ip_v4, sizeof(event.R_ip_v4), &sk->skc_daddr);
+
+BPF_CORE_READ_INTO(&event.L_ip_v6, sk, __sk_common.skc_v6_rcv_saddr.in6_u.u6_addr32);
+BPF_CORE_READ_INTO(&event.R_ip_v6, sk, __sk_common.skc_v6_daddr.in6_u.u6_addr32);
+// bpf_probe_read_kernel(&event.L_ip_v6, sizeof(event.L_ip_v6), &sk->skc_v6_rcv_saddr.in6_u.u6_addr32);
+// bpf_probe_read_kernel(&event.R_ip_v6, sizeof(event.R_ip_v6), &sk->skc_v6_daddr.in6_u.u6_addr32);
+```
 
