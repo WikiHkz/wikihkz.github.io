@@ -1263,3 +1263,29 @@ BPF_CORE_READ_INTO(&event.R_ip_v6, sk, __sk_common.skc_v6_daddr.in6_u.u6_addr32)
 // bpf_probe_read_kernel(&event.R_ip_v6, sizeof(event.R_ip_v6), &sk->skc_v6_daddr.in6_u.u6_addr32);
 ```
 
+
+## 源码
+
+```bash
+tree
+.
+├── CMakeLists.txt
+├── core
+│   ├── CMakeLists.txt
+│   ├── tcpVision.bpf.c
+│   ├── tcpVision.c
+│   └── tcpVision.h
+├── nat
+│   ├── CMakeLists.txt
+│   ├── nat.bpf.c
+│   ├── nat.c
+│   └── nat.h
+└── nonCore
+    ├── CMakeLists.txt
+    ├── tcpVision.bpf.c
+    ├── tcpVision.c
+    └── tcpVision.h
+```
+
+[src](/downloads/2024-12-26/src)
+
